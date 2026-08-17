@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from infer import *
+from infer import evaluate_loftr_pipeline
 
 import kornia.feature as KF
 
