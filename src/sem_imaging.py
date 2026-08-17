@@ -230,12 +230,10 @@ def image_search(
     blurred = gaussian_psf_blur(full_canvas, spot_size_nm, pixel_size_ref_nm, astigmatism_ratio)
     downsampled = downsample_area_average(blurred, factor)
     drifted = apply_raster_drift(downsampled, shear_amplitude_px, drift_jitter_px, rng)
-    distorted = apply_barrel_distortion(drifted, barrel_distortion_k)
-    noisy = add_shot_noise(distorted, dose, rng)
+    noisy = add_shot_noise(drifted, dose, rng)
     noisy = add_detector_noise(noisy, detector_noise_sigma, rng)
     noisy = add_speckle_noise(noisy, speckle_sigma, rng)
     noisy = add_salt_and_pepper_noise(noisy, salt_pepper_prob, rng)
-    noisy = apply_vignette(noisy, vignette_strength)
     noisy = apply_gamma(noisy, gamma)
     noisy = add_charging_streaks(noisy, charging_streak_prob, charging_streak_intensity, rng)
     return noisy

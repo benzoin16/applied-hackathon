@@ -85,7 +85,7 @@ class GenerationParams:
 
 _GENERATORS = {
     "dram": generate_dram_canvas,
-    "finfet": generate_finfet_canvas,
+    # "finfet": generate_finfet_canvas,
 }
 
 

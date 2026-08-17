@@ -88,18 +88,23 @@ class TrainableSiameseTracker(nn.Module):
             param.requires_grad = True
 
     def forward(self, template, search):
-        z = self.backbone(template)
-        x = self.backbone(search)
-        
-        # Batch cross-correlation
-        b, c, h, w = x.shape
-        heatmap = []
-        for i in range(b):
-            # cross-correlate each item in batch
-            hm = F.conv2d(x[i].unsqueeze(0), z[i].unsqueeze(0))
-            heatmap.append(hm)
+            z = self.backbone(template)
+            x = self.backbone(search)
             
-        return torch.cat(heatmap, dim=0)
+            # --- ADD THESE TWO LINES ---
+            # Normalize along the channel dimension (dim=1)
+            z = F.normalize(z, p=2, dim=1)
+            x = F.normalize(x, p=2, dim=1)
+            # ---------------------------
+            
+            # Batch cross-correlation
+            b, c, h, w = x.shape
+            heatmap = []
+            for i in range(b):
+                hm = F.conv2d(x[i].unsqueeze(0), z[i].unsqueeze(0))
+                heatmap.append(hm)
+                
+            return torch.cat(heatmap, dim=0)
 
 # ---------------------------------------------------------
 # 3. Training Loop
