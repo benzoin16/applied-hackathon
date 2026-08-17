@@ -33,7 +33,7 @@ def visualize_dataset(manifest_csv: str, method: str = "ncc", num_samples: int =
         #if method == "ncc":
         #    pred_x, pred_y = solve_drift_ncc(ref_img, search_img)
         if method == "loftr":
-            pred_x, pred_y = evaluate_loftr_pipeline(args.csv_root, tolerance_px=4.0)
+            pred_x, pred_y = evaluate_loftr_pipeline(args.manifest, tolerance_px=4.0)
 
         gt_x, gt_y = row['gt_x'], row['gt_y']
         error_px = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
