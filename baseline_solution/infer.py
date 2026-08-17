@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 import time
+import argparse
 
 class WaferLoFTRDataset(Dataset):
     def __init__(self, manifest_csv: str, target_size=(1024, 1024)):
@@ -122,4 +123,14 @@ def evaluate_loftr_pipeline(manifest_csv: str, tolerance_px: float = 2.0):
     print(f"Mean Navigation Error: {mean_error:.3f} px")
     print(f"Average Inference Latency: {avg_latency:.2f} ms")
 
-evaluate_loftr_pipeline('../output/train/manifest.csv', tolerance_px=4.0)
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--csv_root", default="../output/train/manifest.csv")
+
+    args = ap.parse_args()
+    evaluate_loftr_pipeline(args.csv_root, tolerance_px=4.0)
+
+if __name__ == "__main__":
+    main()
