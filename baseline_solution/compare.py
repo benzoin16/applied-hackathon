@@ -1,140 +1,88 @@
-#!/usr/bin/env python3
 import argparse
-import time
+import os
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torchvision.models as models
+
+from infer import SiameseTracker, predict_single_pair
 
 
-class SiameseTracker(nn.Module):
-    def __init__(self):
-        super().__init__()
-        resnet = models.resnet18(weights=None)
-        self.backbone = nn.Sequential(
-            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-            resnet.layer1, resnet.layer2
-        )
-        self.head = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, ref, search):
-        feat_ref = self.backbone(ref)
-        feat_search = self.backbone(search)
-        fused = torch.abs(feat_ref - feat_search)
-        return self.head(fused)
-
-
-def locate_target_center_from_heatmap(heatmap_tensor):
-    if heatmap_tensor.ndim == 4:
-        heatmap_tensor = heatmap_tensor.squeeze()
-        
-    max_val = torch.max(heatmap_tensor)
-    if max_val < 0.01:
-        h, w = heatmap_tensor.shape
-        return float(w / 2), float(h / 2)
-        
-    flat_idx = torch.argmax(heatmap_tensor)
-    h, w = heatmap_tensor.shape
-    cy = (flat_idx // w).float().item()
-    cx = (flat_idx % w).float().item()
-    return cx, cy
-
-
-def predict_single_pair(ref_img, search_img, model, device, input_size=(256, 256)):
-    h, w = input_size
-    ref_resized = cv2.resize(ref_img, (w, h))
-    search_resized = cv2.resize(search_img, (w, h))
-
-    ref_tensor = torch.from_numpy(ref_resized).float().unsqueeze(0).unsqueeze(0) / 255.0
-    search_tensor = torch.from_numpy(search_resized).float().unsqueeze(0).unsqueeze(0) / 255.0
-
-    if ref_tensor.shape[1] == 1:
-        ref_tensor = ref_tensor.repeat(1, 3, 1, 1)
-        search_tensor = search_tensor.repeat(1, 3, 1, 1)
-
-    ref_tensor = ref_tensor.to(device)
-    search_tensor = search_tensor.to(device)
-
-    with torch.no_grad():
-        heatmap = model(ref_tensor, search_tensor)
-
-    cx_out, cy_out = locate_target_center_from_heatmap(heatmap)
+def visualize_dataset(manifest_csv: str, num_samples: int = 5, save_dir: str = "visualizations"):
+    df = pd.read_csv(manifest_csv)
+    os.makedirs(save_dir, exist_ok=True)
     
-    out_h, out_w = heatmap.shape[-2], heatmap.shape[-1]
-    pred_x = (cx_out / out_w) * w
-    pred_y = (cy_out / out_h) * h
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Initializing Siamese Tracker on [{device}]...")
+    model = SiameseTracker().to(device)
 
-    return pred_x, pred_y
+    # Pick random samples from manifest
+    sample_indices = np.random.choice(len(df), size=min(num_samples, len(df)), replace=False)
+    
+    # 100x100 px reference footprint in search space (10x FOV scale)
+    half_box = 50  
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate Custom Siamese Network on SEM Dataset")
-    parser.add_argument("--manifest", type=str, required=True, help="Path to evaluation manifest CSV")
-    parser.add_argument("--weights", type=str, required=True, help="Path to trained model weights (.pth)")
-    parser.add_argument("--tolerance", type=float, default=4.0, help="Pixel error tolerance threshold")
-    parser.add_argument("--input-size", type=int, default=256, help="Model input resolution")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
-
-    print(f"Loading weights from [{args.weights}] to [{args.device}]...")
-    model = SiameseTracker().to(args.device)
-    state_dict = torch.load(args.weights, map_location=args.device)
-    model.load_state_dict(state_dict)
-    model.eval()
-
-    df = pd.read_csv(args.manifest)
-    print(f"Evaluating {len(df)} samples...")
-
-    success_count = 0
-    total_time_ms = 0.0
-    errors = []
-
-    for _, row in df.iterrows():
+    for idx in sample_indices:
+        row = df.iloc[idx]
         ref_img = cv2.imread(row['reference_path'], cv2.IMREAD_GRAYSCALE)
         search_img = cv2.imread(row['search_path'], cv2.IMREAD_GRAYSCALE)
 
-        if ref_img is None or search_img is None:
-            continue
-
-        orig_h, orig_w = search_img.shape[:2]
-
-        t0 = time.perf_counter()
-        pred_x, pred_y = predict_single_pair(ref_img, search_img, model, args.device, (args.input_size, args.input_size))
-        t1 = time.perf_counter()
-
-        total_time_ms += (t1 - t0) * 1000.0
-
-        scale_x = orig_w / args.input_size
-        scale_y = orig_h / args.input_size
-        pred_x_orig = pred_x * scale_x
-        pred_y_orig = pred_y * scale_y
+        # Run Siamese prediction
+        pred_x, pred_y = predict_single_pair(ref_img, search_img, model, device)
 
         gt_x, gt_y = row['gt_x'], row['gt_y']
+        error_px = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
 
-        error = np.sqrt((pred_x_orig - gt_x)**2 + (pred_y_orig - gt_y)**2)
-        errors.append(error)
+        # Draw overlays on RGB copy of search field
+        search_rgb = cv2.cvtColor(search_img, cv2.COLOR_GRAY2RGB)
 
-        if error <= args.tolerance:
-            success_count += 1
+        # 1. Ground Truth (Green Box & Center Point)
+        cv2.circle(search_rgb, (int(gt_x), int(gt_y)), 6, (0, 255, 0), -1)
+        cv2.rectangle(
+            search_rgb,
+            (int(gt_x - half_box), int(gt_y - half_box)),
+            (int(gt_x + half_box), int(gt_y + half_box)),
+            color=(0, 255, 0),
+            thickness=2
+        )
 
-    accuracy = (success_count / len(df)) * 100.0 if len(df) > 0 else 0.0
-    avg_latency = total_time_ms / len(df) if len(df) > 0 else 0.0
-    mean_error = np.mean(errors) if len(errors) > 0 else 0.0
+        # 2. Model Prediction (Red Box & Center Point)
+        cv2.circle(search_rgb, (int(pred_x), int(pred_y)), 4, (255, 0, 0), -1)
+        cv2.rectangle(
+            search_rgb,
+            (int(pred_x - half_box), int(pred_y - half_box)),
+            (int(pred_x + half_box), int(pred_y + half_box)),
+            color=(255, 0, 0),
+            thickness=2
+        )
 
-    print("=" * 50)
-    print(f"Custom Siamese Accuracy (<= {args.tolerance}px): {accuracy:.2f}%")
-    print(f"Mean Navigation Error:             {mean_error:.3f} px")
-    print(f"Average Inference Latency:          {avg_latency:.2f} ms")
-    print("=" * 50)
+        # Plot Side-by-Side
+        fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+
+        axes[0].imshow(ref_img, cmap='gray')
+        axes[0].set_title(f"Sample #{idx} | Reference Crop (1000x1000)")
+        axes[0].axis('off')
+
+        axes[1].imshow(search_rgb)
+        axes[1].set_title(f"Search Field (Siamese) | Green=GT, Red=Pred | Error: {error_px:.2f} px")
+        axes[1].axis('off')
+
+        plt.tight_layout()
+        
+        save_path = os.path.join(save_dir, f"sample_{idx}_siamese.png")
+        plt.savefig(save_path, bbox_inches='tight', dpi=150)
+        plt.show()
+        plt.close()
+        
+        print(f"Saved visual comparison to {save_path}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Visualize Prediction vs Ground Truth Overlays")
+    parser.add_argument("--manifest", type=str, required=True, help="Path to manifest.csv")
+    parser.add_argument("--num_samples", type=int, default=5, help="Number of random samples to render")
+    parser.add_argument("--save_dir", type=str, default="visualizations")
+
+    args = parser.parse_args()
+    visualize_dataset(args.manifest, args.num_samples, args.save_dir)
