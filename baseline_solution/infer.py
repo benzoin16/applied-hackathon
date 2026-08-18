@@ -134,13 +134,34 @@ def main():
         t1 = time.perf_counter()
 
         total_time_ms += (t1 - t0) * 1000.0
-        gt_x, gt_y = row['gt_x'], row['gt_y']
+        print(f"Evaluating {len(df)} samples...")
+        for _, row in df.iterrows():
+            ref_img = cv2.imread(row['reference_path'], cv2.IMREAD_GRAYSCALE)
+            search_img = cv2.imread(row['search_path'], cv2.IMREAD_GRAYSCALE)
 
-        error = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
-        errors.append(error)
+            # 1. Capture original dimensions before any resizing happens
+            orig_h, orig_w = search_img.shape[:2]
 
-        if error <= args.tolerance:
-            success_count += 1
+            t0 = time.perf_counter()
+            pred_x, pred_y = predict_single_pair(ref_img, search_img, model, device)
+            t1 = time.perf_counter()
+
+            total_time_ms += (t1 - t0) * 1000.0
+
+            # 2. Scale predictions back to original image coordinate space
+            scale_x = orig_w / args.input_size  # or 256, depending on your input size variable
+            scale_y = orig_h / args.input_size
+            pred_x_orig = pred_x * scale_x
+            pred_y_orig = pred_y * scale_y
+
+            gt_x, gt_y = row['gt_x'], row['gt_y']
+
+            # 3. Compute error against original coordinate space GT
+            error = np.sqrt((pred_x_orig - gt_x)**2 + (pred_y_orig - gt_y)**2)
+            errors.append(error)
+
+            if error <= args.tolerance:
+                success_count += 1
 
     accuracy = (success_count / len(df)) * 100.0
     avg_latency = total_time_ms / len(df)

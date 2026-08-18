@@ -12,10 +12,17 @@ import torchvision.models as models
 import cv2
 import numpy as np
 
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
 class WaferDataset(Dataset):
     def __init__(self, manifest_path, img_size=(256, 256)):
         self.df = pd.read_csv(manifest_path)
-        self.img_size = img_size
+        self.img_size = img_size  # (height, width)
 
     def __len__(self):
         return len(self.df)
@@ -23,40 +30,49 @@ class WaferDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
-        # Load grayscale SEM images
+        # 1. Load reference and search images as grayscale
         ref_img = cv2.imread(row['reference_path'], cv2.IMREAD_GRAYSCALE)
         search_img = cv2.imread(row['search_path'], cv2.IMREAD_GRAYSCALE)
         
-        # Resize if necessary
-        if ref_img.shape != self.img_size:
-            ref_img = cv2.resize(ref_img, self.img_size)
-        if search_img.shape != self.img_size:
-            search_img = cv2.resize(search_img, self.img_size)
+        if ref_img is None or search_img is None:
+            raise FileNotFoundError(f"Could not load images for index {idx}: {row['reference_path']} or {row['search_path']}")
+
+        orig_h, orig_w = search_img.shape[:2]
+        target_h, target_w = self.img_size
+        
+        # 2. Resize images to model input size (OpenCV resize expects width, height)
+        if ref_img.shape[:2] != (target_h, target_w):
+            ref_img = cv2.resize(ref_img, (target_w, target_h))
+        if search_img.shape[:2] != (target_h, target_w):
+            search_img = cv2.resize(search_img, (target_w, target_h))
             
-        # Convert grayscale to 3-channel for ResNet backbone
-        ref_img = np.stack([ref_img, ref_img, ref_img], axis=-1)
-        search_img = np.stack([search_img, search_img, search_img], axis=-1)
+        # 3. Scale ground truth coordinates from original image space to model input space
+        scale_x = target_w / orig_w
+        scale_y = target_h / orig_h
+        scaled_gt_x = row['gt_x'] * scale_x
+        scaled_gt_y = row['gt_y'] * scale_y
+
+        # 4. Generate target Gaussian heatmap centered at scaled GT coordinates
+        # ResNet-18 backbone (conv1 to layer2) downsamples spatial dimensions by a factor of 8
+        out_h, out_w = target_h // 8, target_w // 8
+        gt_hx = (scaled_gt_x / target_w) * out_w
+        gt_hy = (scaled_gt_y / target_h) * out_h
         
-        # To tensor & normalize to [0, 1]
-        ref_tensor = torch.from_numpy(ref_img).permute(2, 0, 1).float() / 255.0
-        search_tensor = torch.from_numpy(search_img).permute(2, 0, 1).float() / 255.0
-        
-        # Generate target Gaussian heatmap centered at GT coordinates
-        # (Assuming output feature map is stride 8 downscaled)
-        out_h, out_w = self.img_size[0] // 8, self.img_size[1] // 8
-        target_heatmap = torch.zeros((out_h, out_w), dtype=torch.float32)
-        
-        # Scale GT coordinates to heatmap space
-        gt_hx = (row['gt_x'] / self.img_size[1]) * out_w
-        gt_hy = (row['gt_y'] / self.img_size[0]) * out_h
-        
-        # Populate Gaussian peak
         yy, xx = torch.meshgrid(torch.arange(out_h), torch.arange(out_w), indexing='ij')
         sigma = 2.0
         target_heatmap = torch.exp(-((xx - gt_hx)**2 + (yy - gt_hy)**2) / (2 * sigma**2))
+        
+        # 5. Convert to PyTorch tensors and normalize to [0, 1]
+        ref_tensor = torch.from_numpy(ref_img).float().unsqueeze(0) / 255.0
+        search_tensor = torch.from_numpy(search_img).float().unsqueeze(0) / 255.0
+        
+        # If your ResNet backbone expects 3 channels (due to pretrained ImageNet weights):
+        if ref_tensor.shape[0] == 1:
+            ref_tensor = ref_tensor.repeat(3, 1, 1)
+            search_tensor = search_tensor.repeat(3, 1, 1)
 
+        # Return images and the target heatmap with channel dimension [1, out_h, out_w]
         return ref_tensor, search_tensor, target_heatmap.unsqueeze(0)
-
 
 class CustomSiameseNetwork(nn.Module):
     def __init__(self):
