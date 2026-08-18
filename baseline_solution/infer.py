@@ -63,8 +63,13 @@ def predict_single_pair(ref_img, search_img, model, device, input_size=(256, 256
     ref_tensor = ref_tensor.to(device)
     search_tensor = search_tensor.to(device)
 
+    model.eval()
     with torch.no_grad():
         heatmap = model(ref_tensor, search_tensor)
+        
+        # --- PUT YOUR TEST SNIPPET HERE ---
+        print("min/max/std:", heatmap.min().item(), heatmap.max().item(), heatmap.std().item())
+        # -----------------------------------
 
     cx_out, cy_out = locate_target_center_from_heatmap(heatmap)
     
