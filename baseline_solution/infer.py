@@ -9,7 +9,7 @@ import torch.nn as nn
 import torchvision.models as models
 
 
-class CustomSiameseNetwork(nn.Module):
+class SiameseTracker(nn.Module):
     def __init__(self):
         super().__init__()
         resnet = models.resnet18(weights=None)
@@ -17,7 +17,6 @@ class CustomSiameseNetwork(nn.Module):
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
             resnet.layer1, resnet.layer2
         )
-        # Fixed: Input channels set to 128 to match layer2 output
         self.head = nn.Sequential(
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
@@ -67,7 +66,6 @@ def predict_single_pair(ref_img, search_img, model, device, input_size=(256, 256
     with torch.no_grad():
         heatmap = model(ref_tensor, search_tensor)
 
-    # ResNet-18 layer2 provides an 8x spatial downsample
     cx_out, cy_out = locate_target_center_from_heatmap(heatmap)
     
     out_h, out_w = heatmap.shape[-2], heatmap.shape[-1]
@@ -87,7 +85,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading weights from [{args.weights}] to [{args.device}]...")
-    model = CustomSiameseNetwork().to(args.device)
+    model = SiameseTracker().to(args.device)
     state_dict = torch.load(args.weights, map_location=args.device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -106,7 +104,6 @@ def main():
         if ref_img is None or search_img is None:
             continue
 
-        # Capture original dimensions for proper coordinate rescaling back
         orig_h, orig_w = search_img.shape[:2]
 
         t0 = time.perf_counter()
@@ -115,7 +112,6 @@ def main():
 
         total_time_ms += (t1 - t0) * 1000.0
 
-        # Scale predictions back from input-size coordinate space to original image space
         scale_x = orig_w / args.input_size
         scale_y = orig_h / args.input_size
         pred_x_orig = pred_x * scale_x
@@ -123,7 +119,6 @@ def main():
 
         gt_x, gt_y = row['gt_x'], row['gt_y']
 
-        # Compute error in original pixel space
         error = np.sqrt((pred_x_orig - gt_x)**2 + (pred_y_orig - gt_y)**2)
         errors.append(error)
 
