@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Inference and Evaluation script with empirical stride mapping & sub-pixel refinement."""
-
 import argparse
 import time
 import cv2
@@ -19,10 +17,9 @@ class CustomSiameseNetwork(nn.Module):
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
             resnet.layer1, resnet.layer2
         )
-        
-        # FIX: Change input channels from 512 to 128 here as well
+        # Fixed: Input channels set to 128 to match layer2 output
         self.head = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),  # <--- Changed 512 -> 128
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 1, kernel_size=1),
@@ -36,136 +33,106 @@ class CustomSiameseNetwork(nn.Module):
         return self.head(fused)
 
 
-def get_empirical_mapping(input_size=(256, 256)):
-    """Dynamically computes exact feature map strides to avoid hardcoded offset errors."""
-    resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    backbone = torch.nn.Sequential(
-        resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-        resnet.layer1, resnet.layer2
-    ).eval()
-
-    with torch.no_grad():
-        dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
-        out = backbone(dummy_input)
-        out_h, out_w = out.shape[2], out.shape[3]
-       
-    stride_y = input_size[0] / out_h
-    stride_x = input_size[1] / out_w
-    return stride_x, stride_y, (out_h, out_w)
-
-
-def subpixel_refinement(heatmap, max_y, max_x):
-    """Applies local center-of-mass adjustment for sub-pixel accuracy."""
-    h, w = heatmap.shape
-    if max_y <= 0 or max_y >= h - 1 or max_x <= 0 or max_x >= w - 1:
-        return float(max_x), float(max_y)
-    
-    patch = heatmap[max_y-1:max_y+2, max_x-1:max_x+2]
-    patch_sum = patch.sum()
-    if patch_sum == 0:
-        return float(max_x), float(max_y)
+def locate_target_center_from_heatmap(heatmap_tensor):
+    if heatmap_tensor.ndim == 4:
+        heatmap_tensor = heatmap_tensor.squeeze()
         
-    dy = (torch.sum(torch.arange(-1, 2, device=patch.device) * patch.sum(dim=1)) / patch_sum).item()
-    dx = (torch.sum(torch.arange(-1, 2, device=patch.device) * patch.sum(dim=0)) / patch_sum).item()
-    
-    return max_x + dx, max_y + dy
+    max_val = torch.max(heatmap_tensor)
+    if max_val < 0.01:
+        h, w = heatmap_tensor.shape
+        return float(w / 2), float(h / 2)
+        
+    flat_idx = torch.argmax(heatmap_tensor)
+    h, w = heatmap_tensor.shape
+    cy = (flat_idx // w).float().item()
+    cx = (flat_idx % w).float().item()
+    return cx, cy
 
 
 def predict_single_pair(ref_img, search_img, model, device, input_size=(256, 256)):
-    # Preprocess images (Grayscale -> 3-Channel -> Normalization)
-    if ref_img.shape != input_size:
-        ref_img = cv2.resize(ref_img, input_size)
-    if search_img.shape != input_size:
-        search_img = cv2.resize(search_img, input_size)
+    h, w = input_size
+    ref_resized = cv2.resize(ref_img, (w, h))
+    search_resized = cv2.resize(search_img, (w, h))
 
-    ref_img = np.stack([ref_img, ref_img, ref_img], axis=-1)
-    search_img = np.stack([search_img, search_img, search_img], axis=-1)
+    ref_tensor = torch.from_numpy(ref_resized).float().unsqueeze(0).unsqueeze(0) / 255.0
+    search_tensor = torch.from_numpy(search_resized).float().unsqueeze(0).unsqueeze(0) / 255.0
 
-    ref_tensor = torch.from_numpy(ref_img).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-    search_tensor = torch.from_numpy(search_img).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+    if ref_tensor.shape[1] == 1:
+        ref_tensor = ref_tensor.repeat(1, 3, 1, 1)
+        search_tensor = search_tensor.repeat(1, 3, 1, 1)
 
-    ref_tensor, search_tensor = ref_tensor.to(device), search_tensor.to(device)
+    ref_tensor = ref_tensor.to(device)
+    search_tensor = search_tensor.to(device)
 
     with torch.no_grad():
-        heatmap = model(ref_tensor, search_tensor).squeeze()
+        heatmap = model(ref_tensor, search_tensor)
 
-    # Find peak activation
-    max_val_flat = torch.argmax(heatmap)
-    max_loc_y, max_loc_x = torch.unravel_index(max_val_flat, heatmap.shape)
-
-    # Sub-pixel refinement
-    refined_x, refined_y = subpixel_refinement(heatmap, max_loc_y.item(), max_loc_x.item())
-
-    # Map back using empirical stride
-    stride_x, stride_y, _ = get_empirical_mapping(input_size)
-    pred_x = refined_x * stride_x
-    pred_y = refined_y * stride_y
+    # ResNet-18 layer2 provides an 8x spatial downsample
+    cx_out, cy_out = locate_target_center_from_heatmap(heatmap)
+    
+    out_h, out_w = heatmap.shape[-2], heatmap.shape[-1]
+    pred_x = (cx_out / out_w) * w
+    pred_y = (cy_out / out_h) * h
 
     return pred_x, pred_y
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", default="./output/train_manifest.csv")
-    parser.add_argument("--weights", default="siamese_wafer_epoch_10.pth")
-    parser.add_argument("--tolerance", type=float, default=4.0)
-    parser.add_argument("--input-size", type=int, default=256)
+    parser = argparse.ArgumentParser(description="Evaluate Custom Siamese Network on SEM Dataset")
+    parser.add_argument("--manifest", type=str, required=True, help="Path to evaluation manifest CSV")
+    parser.add_argument("--weights", type=str, required=True, help="Path to trained model weights (.pth)")
+    parser.add_argument("--tolerance", type=float, default=4.0, help="Pixel error tolerance threshold")
+    parser.add_argument("--input-size", type=int, default=256, help="Model input resolution")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading weights from [{args.weights}] to [{device}]...")
-
-    model = CustomSiameseNetwork().to(device)
-    model.load_state_dict(torch.load(args.weights, map_location=device))
+    print(f"Loading weights from [{args.weights}] to [{args.device}]...")
+    model = CustomSiameseNetwork().to(args.device)
+    state_dict = torch.load(args.weights, map_location=args.device)
+    model.load_state_dict(state_dict)
     model.eval()
 
     df = pd.read_csv(args.manifest)
-    errors = []
+    print(f"Evaluating {len(df)} samples...")
+
     success_count = 0
     total_time_ms = 0.0
+    errors = []
 
-    print(f"Evaluating {len(df)} samples...")
     for _, row in df.iterrows():
         ref_img = cv2.imread(row['reference_path'], cv2.IMREAD_GRAYSCALE)
         search_img = cv2.imread(row['search_path'], cv2.IMREAD_GRAYSCALE)
 
+        if ref_img is None or search_img is None:
+            continue
+
+        # Capture original dimensions for proper coordinate rescaling back
+        orig_h, orig_w = search_img.shape[:2]
+
         t0 = time.perf_counter()
-        pred_x, pred_y = predict_single_pair(ref_img, search_img, model, device, (args.input_size, args.input_size))
+        pred_x, pred_y = predict_single_pair(ref_img, search_img, model, args.device, (args.input_size, args.input_size))
         t1 = time.perf_counter()
 
         total_time_ms += (t1 - t0) * 1000.0
-        print(f"Evaluating {len(df)} samples...")
-        for _, row in df.iterrows():
-            ref_img = cv2.imread(row['reference_path'], cv2.IMREAD_GRAYSCALE)
-            search_img = cv2.imread(row['search_path'], cv2.IMREAD_GRAYSCALE)
 
-            # 1. Capture original dimensions before any resizing happens
-            orig_h, orig_w = search_img.shape[:2]
+        # Scale predictions back from input-size coordinate space to original image space
+        scale_x = orig_w / args.input_size
+        scale_y = orig_h / args.input_size
+        pred_x_orig = pred_x * scale_x
+        pred_y_orig = pred_y * scale_y
 
-            t0 = time.perf_counter()
-            pred_x, pred_y = predict_single_pair(ref_img, search_img, model, device)
-            t1 = time.perf_counter()
+        gt_x, gt_y = row['gt_x'], row['gt_y']
 
-            total_time_ms += (t1 - t0) * 1000.0
+        # Compute error in original pixel space
+        error = np.sqrt((pred_x_orig - gt_x)**2 + (pred_y_orig - gt_y)**2)
+        errors.append(error)
 
-            # 2. Scale predictions back to original image coordinate space
-            scale_x = orig_w / args.input_size  # or 256, depending on your input size variable
-            scale_y = orig_h / args.input_size
-            pred_x_orig = pred_x * scale_x
-            pred_y_orig = pred_y * scale_y
+        if error <= args.tolerance:
+            success_count += 1
 
-            gt_x, gt_y = row['gt_x'], row['gt_y']
-
-            # 3. Compute error against original coordinate space GT
-            error = np.sqrt((pred_x_orig - gt_x)**2 + (pred_y_orig - gt_y)**2)
-            errors.append(error)
-
-            if error <= args.tolerance:
-                success_count += 1
-
-    accuracy = (success_count / len(df)) * 100.0
-    avg_latency = total_time_ms / len(df)
-    mean_error = np.mean(errors)
+    accuracy = (success_count / len(df)) * 100.0 if len(df) > 0 else 0.0
+    avg_latency = total_time_ms / len(df) if len(df) > 0 else 0.0
+    mean_error = np.mean(errors) if len(errors) > 0 else 0.0
 
     print("=" * 50)
     print(f"Custom Siamese Accuracy (<= {args.tolerance}px): {accuracy:.2f}%")
