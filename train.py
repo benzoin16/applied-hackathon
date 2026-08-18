@@ -1,35 +1,21 @@
+#!/usr/bin/env python3
+"""Training script for the Custom Siamese SEM Localization Network."""
+
 import argparse
-import time
-import cv2
-import numpy as np
+import os
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.optim import Adam
 import torchvision.models as models
+import cv2
+import numpy as np
 
-# ---------------------------------------------------------
-# 1. Dataset & Ground Truth Heatmap Generator
-# ---------------------------------------------------------
-def create_gaussian_heatmap(target_size, center_x, center_y, sigma=2.0):
-    w, h = target_size
-    x = np.arange(0, w, 1, float)
-    y = np.arange(0, h, 1, float)
-    y = y[:, np.newaxis]
-    
-    # Generate 2D Gaussian
-    heatmap = np.exp(-((x - center_x)**2 + (y - center_y)**2) / (2 * sigma**2))
-    return heatmap
-
-class WaferSiameseTrainDataset(Dataset):
-    def __init__(self, manifest_csv: str):
-        self.df = pd.read_csv(manifest_csv)
-        
-        # ImageNet normalization stats
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        self.std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+class WaferDataset(Dataset):
+    def __init__(self, manifest_path, img_size=(256, 256)):
+        self.df = pd.read_csv(manifest_path)
+        self.img_size = img_size
 
     def __len__(self):
         return len(self.df)
@@ -37,125 +23,123 @@ class WaferSiameseTrainDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
+        # Load grayscale SEM images
         ref_img = cv2.imread(row['reference_path'], cv2.IMREAD_GRAYSCALE)
         search_img = cv2.imread(row['search_path'], cv2.IMREAD_GRAYSCALE)
         
-        # 1. Scale reference to 100x100 to match scale
-        ref_10x = cv2.resize(ref_img, (100, 100), interpolation=cv2.INTER_AREA)
-        search_resized = cv2.resize(search_img, (1024, 1024), interpolation=cv2.INTER_AREA)
+        # Resize if necessary
+        if ref_img.shape != self.img_size:
+            ref_img = cv2.resize(ref_img, self.img_size)
+        if search_img.shape != self.img_size:
+            search_img = cv2.resize(search_img, self.img_size)
+            
+        # Convert grayscale to 3-channel for ResNet backbone
+        ref_img = np.stack([ref_img, ref_img, ref_img], axis=-1)
+        search_img = np.stack([search_img, search_img, search_img], axis=-1)
         
-        # 2. Convert to RGB Tensors
-        ref_rgb = cv2.cvtColor(ref_10x, cv2.COLOR_GRAY2RGB)
-        search_rgb = cv2.cvtColor(search_resized, cv2.COLOR_GRAY2RGB)
+        # To tensor & normalize to [0, 1]
+        ref_tensor = torch.from_numpy(ref_img).permute(2, 0, 1).float() / 255.0
+        search_tensor = torch.from_numpy(search_img).permute(2, 0, 1).float() / 255.0
         
-        ref_tensor = torch.from_numpy(ref_rgb).permute(2, 0, 1).float() / 255.0
-        search_tensor = torch.from_numpy(search_rgb).permute(2, 0, 1).float() / 255.0
+        # Generate target Gaussian heatmap centered at GT coordinates
+        # (Assuming output feature map is stride 8 downscaled)
+        out_h, out_w = self.img_size[0] // 8, self.img_size[1] // 8
+        target_heatmap = torch.zeros((out_h, out_w), dtype=torch.float32)
         
-        # Normalize
-        ref_tensor = (ref_tensor - self.mean) / self.std
-        search_tensor = (search_tensor - self.mean) / self.std
+        # Scale GT coordinates to heatmap space
+        gt_hx = (row['gt_x'] / self.img_size[1]) * out_w
+        gt_hy = (row['gt_y'] / self.img_size[0]) * out_h
         
-        # 3. Calculate GT Heatmap coordinates
-        # Search scales from raw to 1024x1024
-        sx = 1024.0 / search_img.shape[1]
-        sy = 1024.0 / search_img.shape[0]
-        gt_x_1024 = row['gt_x'] * sx
-        gt_y_1024 = row['gt_y'] * sy
-        
-        # The feature map is downsampled by 8x (ResNet up to layer2)
-        # Template anchors at its top-left, so we offset by 50 (half the 100x100 template)
-        hm_x = (gt_x_1024 - 50.0) / 8.0
-        hm_y = (gt_y_1024 - 50.0) / 8.0
-        
-        # The output heatmap dimension for a 1024 search and 100 template is 116x116
-        heatmap = create_gaussian_heatmap((116, 116), hm_x, hm_y, sigma=2.0)
-        heatmap_tensor = torch.from_numpy(heatmap).float().unsqueeze(0) # [1, 116, 116]
-        
-        return ref_tensor, search_tensor, heatmap_tensor
+        # Populate Gaussian peak
+        yy, xx = torch.meshgrid(torch.arange(out_h), torch.arange(out_w), indexing='ij')
+        sigma = 2.0
+        target_heatmap = torch.exp(-((xx - gt_hx)**2 + (yy - gt_hy)**2) / (2 * sigma**2))
 
-# ---------------------------------------------------------
-# 2. Trainable Siamese Network
-# ---------------------------------------------------------
-class TrainableSiameseTracker(nn.Module):
+        return ref_tensor, search_tensor, target_heatmap.unsqueeze(0)
+
+
+class CustomSiameseNetwork(nn.Module):
     def __init__(self):
         super().__init__()
+        # Use pretrained ResNet-18 backbone for robust feature extraction
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        # Keep up to layer2 (stride of 8)
-        self.backbone = nn.Sequential(*list(resnet.children())[:6])
+        self.backbone = nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+            resnet.layer1, resnet.layer2
+        )
         
-        # Unfreeze all layers so we can fine-tune
-        for param in self.backbone.parameters():
-            param.requires_grad = True
+        # Fusion and heatmap regression head
+        self.head = nn.Sequential(
+            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
 
-    def forward(self, template, search):
-            z = self.backbone(template)
-            x = self.backbone(search)
-            
-            # --- ADD THESE TWO LINES ---
-            # Normalize along the channel dimension (dim=1)
-            z = F.normalize(z, p=2, dim=1)
-            x = F.normalize(x, p=2, dim=1)
-            # ---------------------------
-            
-            # Batch cross-correlation
-            b, c, h, w = x.shape
-            heatmap = []
-            for i in range(b):
-                hm = F.conv2d(x[i].unsqueeze(0), z[i].unsqueeze(0))
-                heatmap.append(hm)
-                
-            return torch.cat(heatmap, dim=0)
+    def forward(self, ref, search):
+        feat_ref = self.backbone(ref)
+        feat_search = self.backbone(search)
+        
+        # Correlation / Absolute difference fusion
+        fused = torch.abs(feat_ref - feat_search)
+        heatmap = self.head(fused)
+        return heatmap
 
-# ---------------------------------------------------------
-# 3. Training Loop
-# ---------------------------------------------------------
-def train(manifest_csv: str, epochs: int = 10, batch_size: int = 8, lr: float = 1e-4):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Starting training on {device}...")
-    
-    dataset = WaferSiameseTrainDataset(manifest_csv)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    
-    model = TrainableSiameseTracker().to(device)
-    optimizer = Adam(model.parameters(), lr=lr)
-    
-    # Mean Squared Error for heatmap regression
-    criterion = nn.MSELoss()
-    
-    for epoch in range(epochs):
+
+class CenterNetWeightedMSELoss(nn.Module):
+    """Downweights easy background negatives, upweights peaks and near-peak pixels."""
+    def __init__(self, alpha=2.0, beta=4.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(self, pred_heatmap, target_heatmap):
+        weights = torch.where(target_heatmap > 0.01, self.alpha, self.beta)
+        loss = weights * (pred_heatmap - target_heatmap) ** 2
+        return loss.mean()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", default="./output/train_manifest.csv")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    dataset = WaferDataset(args.manifest)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+
+    model = CustomSiameseNetwork().to(device)
+    criterion = CenterNetWeightedMSELoss(alpha=10.0, beta=1.0)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+
+    for epoch in range(args.epochs):
         model.train()
-        epoch_loss = 0.0
-        t0 = time.time()
+        running_loss = 0.0
         
-        for batch_idx, (ref, search, gt_heatmap) in enumerate(dataloader):
-            ref, search, gt_heatmap = ref.to(device), search.to(device), gt_heatmap.to(device)
+        for ref, search, target in dataloader:
+            ref, search, target = ref.to(device), search.to(device), target.to(device)
             
             optimizer.zero_grad()
-            
-            # Predict heatmap
-            pred_heatmap = model(ref, search)
-            
-            # Calculate loss against Gaussian GT
-            loss = criterion(pred_heatmap, gt_heatmap)
+            pred = model(ref, search)
+            loss = criterion(pred, target)
             loss.backward()
             optimizer.step()
             
-            epoch_loss += loss.item()
+            running_loss += loss.item()
             
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.6f} | Time: {time.time()-t0:.1f}s")
+        epoch_loss = running_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{args.epochs}] | Loss: {epoch_loss:.6f}")
         
         # Save checkpoint
         torch.save(model.state_dict(), f"siamese_wafer_epoch_{epoch+1}.pth")
-        
-    print("Training Complete. Weights saved.")
+
+    print("Training complete. Weights saved.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=str, default="../output/train/manifest.csv")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    args = parser.parse_args()
-    
-    train(args.manifest, args.epochs, args.batch_size, args.lr)
+    main()
