@@ -19,8 +19,10 @@ class CustomSiameseNetwork(nn.Module):
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
             resnet.layer1, resnet.layer2
         )
+        
+        # FIX: Change input channels from 512 to 128 here as well
         self.head = nn.Sequential(
-            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),  # <--- Changed 512 -> 128
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 1, kernel_size=1),

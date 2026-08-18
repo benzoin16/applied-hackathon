@@ -61,16 +61,15 @@ class WaferDataset(Dataset):
 class CustomSiameseNetwork(nn.Module):
     def __init__(self):
         super().__init__()
-        # Use pretrained ResNet-18 backbone for robust feature extraction
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         self.backbone = nn.Sequential(
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
             resnet.layer1, resnet.layer2
         )
         
-        # Fusion and heatmap regression head
+        # FIX: Change input channels from 512 to 128 (since layer2 outputs 128 channels)
         self.head = nn.Sequential(
-            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),  # <--- Changed 512 -> 128
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 1, kernel_size=1),
@@ -80,8 +79,6 @@ class CustomSiameseNetwork(nn.Module):
     def forward(self, ref, search):
         feat_ref = self.backbone(ref)
         feat_search = self.backbone(search)
-        
-        # Correlation / Absolute difference fusion
         fused = torch.abs(feat_ref - feat_search)
         heatmap = self.head(fused)
         return heatmap
